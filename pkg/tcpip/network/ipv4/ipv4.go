@@ -16,6 +16,7 @@
 package ipv4
 
 import (
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -546,9 +547,12 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 		if !ready {
 			return
 		}
-	}
 
+		h.SetTotalLength(uint16(pkt.Data.Size() + len((h))))
+		h.SetFlagsFragmentOffset(0, 0)
+	}
 	r.Stats().IP.PacketsDelivered.Increment()
+
 	p := h.TransportProtocol()
 	if p == header.ICMPv4ProtocolNumber {
 		// TODO(gvisor.dev/issues/3810): when we sort out ICMP and transport
@@ -557,6 +561,26 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 		pkt.TransportProtocolNumber = p
 		e.handleICMP(r, pkt)
 		return
+	}
+	if len(h.Options()) != 0 {
+		aux, _, err := processIPOptions(r, h.Options(), &optionUsageReceive{})
+		if err != nil {
+			switch {
+			case
+				errors.Is(err, header.ErrIPv4OptDuplicate),
+				errors.Is(err, errIPv4RecordRouteOptInvalidPointer),
+				errors.Is(err, errIPv4TimestampOptInvalidLength),
+				errors.Is(err, errIPv4TimestampOptInvalidPointer),
+				errors.Is(err, errIPv4TimestampOptOverflow):
+				_ = e.protocol.returnError(r, &icmpReasonParamProblem{pointer: aux}, pkt)
+				e.protocol.stack.Stats().MalformedRcvdPackets.Increment()
+				r.Stats().IP.MalformedPacketsReceived.Increment()
+			}
+			return
+		}
+		// TODO(gvisor.dev/issue/4586):
+		// When we add forwarding support we should use the verified options
+		// rather than just throwing them away.
 	}
 
 	switch res := e.dispatcher.DeliverTransportPacket(r, p, pkt); res {
@@ -881,4 +905,285 @@ func buildNextFragment(pf *fragmentation.PacketFragmenter, originalIPHeader head
 	nextFragIPHeader.SetChecksum(^nextFragIPHeader.CalculateChecksum())
 
 	return fragPkt, more
+}
+
+type optionAction uint8
+
+const (
+	// optionRemove says that the option should not be in the output option set.
+	optionRemove optionAction = iota
+	// optionProcess says that the option should be fully processed.
+	optionProcess
+	// optionVerify says the option should be checked and passed unchanged.
+	optionVerify
+	// optionPass says to pass the output set without checking.
+	optionPass
+)
+
+// optionActions list what to do for each option in a given scenario.
+type optionActions struct {
+	// What to do with a Timestamp option
+	timestamp optionAction
+	// What to do with a Record Route option
+	recordRoute optionAction
+	// Whether to pass on an unknown option
+	unknown optionAction
+}
+
+// The optionsUsage type enumerates the ways options may be operated upon
+// during packet processing.
+type optionsUsage interface {
+	actions() optionActions
+}
+
+// optionUsageReceive shows what to do with each option on reception.
+type optionUsageReceive struct{}
+
+// actions implements optionsUsage.
+func (*optionUsageReceive) actions() optionActions {
+	return optionActions{
+		timestamp:   optionVerify,
+		recordRoute: optionVerify,
+		unknown:     optionPass,
+	}
+}
+
+// TODO(gvisor.dev/issue/4586): add an entry here for forwarding when it
+// is enabled. (Process, Process, Pass) Also Fragmenting, (similar for frag1
+// but remove,remove,remove for all other frags)
+
+// optionUsageReceive shows what to do with each option on echo.
+type optionUsageEcho struct{}
+
+// actions implements optionsUsage.
+func (*optionUsageEcho) actions() optionActions {
+	return optionActions{
+		timestamp:   optionProcess,
+		recordRoute: optionProcess,
+		unknown:     optionRemove,
+	}
+}
+
+// These errors are specific to Timestamp option processing.
+var (
+	errIPv4TimestampOptInvalidLength  = errors.New("invalid timestamp length")
+	errIPv4TimestampOptInvalidPointer = errors.New("invalid timestamp pointer")
+	errIPv4TimestampOptOverflow       = errors.New("timestamp overflow")
+	errIPv4TimestampOptInvalidFlags   = errors.New("invalid timestamp flags")
+)
+
+func handleTimestamp(tsOpt header.IPv4OptionTimestamp, localAddress tcpip.Address, clock tcpip.Clock, usage optionsUsage) (byte, error) {
+	flags := tsOpt.Flags()
+	optlen := tsOpt.Size()
+
+	var entrySize uint8
+	switch flags {
+	case header.IPv4OptionTimestampOnlyFlag:
+		entrySize = header.IPv4OptionTimestampSize
+	case
+		header.IPv4OptionTimestampWithIPFlag,
+		header.IPv4OptionTimestampWithPredefinedIPFlag:
+		entrySize = header.IPv4OptionTimestampWithAddrSize
+	default:
+		return header.IPv4OptTSOFLWAndFLGOffset, errIPv4TimestampOptInvalidFlags
+	}
+
+	pointer := tsOpt.Pointer()
+	// Step past the header
+	// Set 'nextSlot' to be a 0 based offset from the base of the timestamp
+	// data section. In the packet it is a 1 based offset from the start of the
+	// timestamp header.
+	// Also make optlen based on the data part for consistency.
+	nextSlot := pointer - (header.IPv4OptionTimestampHdrLength + 1)
+	optlen -= header.IPv4OptionTimestampHdrLength
+
+	if optlen%entrySize != 0 {
+		return header.IPv4OptionLengthOffset, errIPv4TimestampOptInvalidLength
+	}
+	// RFC 791 (page 22) says we should switch to using the overflow count.
+	//    If the timestamp data area is already full (the pointer exceeds
+	//    the length) the datagram is forwarded without inserting the
+	//    timestamp, but the overflow count is incremented by one.
+	if nextSlot >= optlen {
+		if flags == header.IPv4OptionTimestampWithPredefinedIPFlag {
+			// By definition we have nothing to do.
+			return 0, nil
+		}
+		if tsOpt.IncOverflow() != 0 {
+			return 0, nil
+		}
+		// The overflow count is also full.
+		//
+		// RFC 791 (page 22) says we should discard the packet.
+		//    If there is some room but not enough room for a full timestamp
+		//    to be inserted, or the overflow count itself overflows, the
+		//    original datagram is considered to be in error and is discarded.
+		//    In either case an ICMP parameter problem message may be sent to
+		//    the source host [3].
+		//
+		//  However on the destination host overflow of the overflow count is not
+		//  fatal. (RFC 1122 section 3.2.1.8.e paragraph 3 on page 38).
+		//
+		if usage.actions().timestamp == optionVerify {
+			return 0, nil
+		}
+		return header.IPv4OptTSOFLWAndFLGOffset, errIPv4TimestampOptOverflow
+	}
+
+	if nextSlot > optlen-entrySize {
+		// The data area isn't full but there isn't room for a new entry.
+		// RFC 791 (see above) suggests this is a different error to being full
+		// as we don't use the overflow counter.
+		return header.IPv4OptTSPointerOffset, errIPv4TimestampOptInvalidPointer
+	}
+
+	if usage.actions().timestamp == optionProcess {
+		tsOpt.UpdateTimestamp(localAddress, clock)
+	}
+	return 0, nil
+}
+
+// These errors are specific to RecordRoute option processing.
+var (
+	errIPv4RecordRouteOptInvalidLength  = errors.New("record Route invalid length")
+	errIPv4RecordRouteOptInvalidPointer = errors.New("record Route invalid pointer")
+)
+
+// handleRecordRoute checks and processes a Record route option. This is
+// commonly used in ping -R. It is much like the timestamp type 1 option, but
+// without timestamps.
+func handleRecordRoute(rrOpt header.IPv4OptionRecordRoute, localAddress tcpip.Address, usage optionsUsage) (byte, error) {
+	optlen := rrOpt.Size()
+
+	if optlen < header.IPv4AddressSize+header.IPv4OptionRecordRouteHdrLength {
+		return header.IPv4OptionLengthOffset, errIPv4RecordRouteOptInvalidLength
+	}
+
+	nextSlot := rrOpt.Pointer() - 1 // Pointer is 1 based.
+
+	// RFC 791 page 21 says
+	//       If the route data area is already full (the pointer exceeds the
+	//       length) the datagram is forwarded without inserting the address
+	//       into the recorded route. If there is some room but not enough
+	//       room for a full address to be inserted, the original datagram is
+	//       considered to be in error and is discarded.  In either case an
+	//       ICMP parameter problem message may be sent to the source
+	//       host.
+	// The use of the words "In either case" suggests that a 'full' RR option
+	// could generate an ICMP at every hop after it fills up. We chose to not
+	// do this (as do most implementations). It is probable that the inclusion
+	// of these words is a copy/paste error from the timestamp option where
+	// there are two failure reasons given.
+	if nextSlot >= optlen {
+		return 0, nil
+	}
+
+	// Check for bad pointer value. Multiple of 4 after accounting for the 3 byte
+	// header and not within that header. (RFC 791, page 20)
+	//       The pointer is relative to this option, and the
+	//       smallest legal value for the pointer is 4.
+	//
+	//       A recorded route is composed of a series of internet addresses.
+	//       Each internet address is 32 bits or 4 octets.
+	if (nextSlot < header.IPv4OptionRecordRouteHdrLength) ||
+		((nextSlot-header.IPv4OptionRecordRouteHdrLength)%header.IPv4AddressSize) != 0 {
+		return header.IPv4OptionRecordRoutePointer, errIPv4RecordRouteOptInvalidPointer
+	}
+
+	if usage.actions().recordRoute == optionVerify {
+		return 0, nil
+	}
+
+	// Room for a whole entry (See quote from RFC 791 above).
+	if nextSlot+header.IPv4AddressSize > optlen {
+		return header.IPv4OptTSPointerOffset, errIPv4RecordRouteOptInvalidPointer
+	}
+
+	rrOpt.StoreAddress(localAddress)
+	return 0, nil
+}
+
+// processIPOptions parses the IPv4 options and produces a new set of options
+// suitable for use in the next step of packet processing as informed by usage.
+// The original will not be touched.
+//
+// Returns
+// - The location of an error if there was one (or 0 if no error)
+// - If there is an error, information as to what it was was.
+// - The replacement option set.
+func processIPOptions(r *stack.Route, orig header.IPv4Options, usage optionsUsage) (byte, header.IPv4Options, error) {
+
+	opts := header.IPv4Options(orig)
+	optIter := opts.MakeIterator()
+
+	var seenOptions [256]bool
+
+	// TODO(gvisor.dev/issue/4586):
+	// This will need tweaking  when we start really forwarding packets
+	// as we may need to get two addresses, for rx and tx interfaces.
+	// We will also have to take usage into account.
+	prefixedAddress, err := r.Stack().GetMainNICAddress(r.NICID(), ProtocolNumber)
+	localAddress := prefixedAddress.Address
+	if err != nil {
+		localAddress = r.LocalAddress
+	}
+
+	for {
+		option, done, err := optIter.Next()
+		if done || err != nil {
+			return optIter.ErrCursor, optIter.Finalize(), err
+		}
+		optType := option.Type()
+		if optType == header.IPv4OptionNOPType {
+			optIter.PushByte(optType)
+			continue
+		}
+		if optType == header.IPv4OptionListEndType {
+			optIter.PushByte(optType)
+			return 0 /*errCursor */, optIter.Finalize(), nil /* err */
+		}
+
+		// check for repeating options (multiple NOPs are OK)
+		if seenOptions[optType] {
+			return optIter.ErrCursor, nil, header.ErrIPv4OptDuplicate
+		}
+		seenOptions[optType] = true
+
+		optLen := int(option.Size())
+		switch option := option.(type) {
+		case *header.IPv4OptionTimestamp:
+			r.Stats().IP.OptionTSReceived.Increment()
+			if usage.actions().timestamp != optionRemove {
+				clock := r.Stack().Clock()
+				newBuffer := optIter.RemainingBuffer()[:len(*option)]
+				_ = copy(newBuffer, option.Contents())
+				offset, err := handleTimestamp(header.IPv4OptionTimestamp(newBuffer), localAddress, clock, usage)
+				if err != nil {
+					return optIter.ErrCursor + offset, nil, err
+				}
+				optIter.ConsumeBuffer(optLen)
+			}
+
+		case *header.IPv4OptionRecordRoute:
+			r.Stats().IP.OptionRRReceived.Increment()
+			if usage.actions().recordRoute != optionRemove {
+				newBuffer := optIter.RemainingBuffer()[:len(*option)]
+				_ = copy(newBuffer, option.Contents())
+				offset, err := handleRecordRoute(header.IPv4OptionRecordRoute(newBuffer), localAddress, usage)
+				if err != nil {
+					return optIter.ErrCursor + offset, nil, err
+				}
+				optIter.ConsumeBuffer(optLen)
+			}
+
+		default:
+			r.Stats().IP.OptionUnknownReceived.Increment()
+			if usage.actions().unknown == optionPass {
+				newBuffer := optIter.RemainingBuffer()[:optLen]
+				// Arguments already heavily checked.. ignore result.
+				_ = copy(newBuffer, option.Contents())
+				optIter.ConsumeBuffer(optLen)
+			}
+		}
+	}
 }

@@ -15,6 +15,7 @@
 package ipv4
 
 import (
+	"errors"
 	"fmt"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -23,10 +24,10 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
-// handleControl handles the case when an ICMP packet contains the headers of
-// the original packet that caused the ICMP one to be sent. This information is
-// used to find out which transport endpoint must be notified about the ICMP
-// packet.
+// handleControl handles the case when an ICMP error packet contains the headers
+// of the original packet that caused the ICMP one to be sent. This information
+// is used to find out which transport endpoint must be notified about the ICMP
+// packet. We only expect the payload, not the enclosing ICMP packet.
 func (e *endpoint) handleControl(typ stack.ControlType, extra uint32, pkt *stack.PacketBuffer) {
 	h, ok := pkt.Data.PullUp(header.IPv4MinimumSize)
 	if !ok {
@@ -73,22 +74,56 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer) {
 	}
 	h := header.ICMPv4(v)
 
+	// Only do in-stack processing if the checksum is correct.
+	if header.ChecksumVV(pkt.Data, 0 /* initial */) != 0xffff {
+		// It's possible that a raw socket still expects to receive this.
+		switch h.Type() { // backwards compatibility
+		case header.ICMPv4Echo:
+			e.dispatcher.DeliverTransportPacket(r, header.ICMPv4ProtocolNumber, pkt)
+		}
+		received.Invalid.Increment()
+		return
+	}
+
+	iph := header.IPv4(pkt.NetworkHeader().View())
+	var newOptions header.IPv4Options
+	if len(iph) > header.IPv4MinimumSize {
+		// RFC 1122 3.2.2.6 ( page 43) (and similar for other round trip type
+		// ICMP packets)
+		//            If a Record Route and/or Time Stamp option is received in an
+		//            ICMP Echo Request, this option (these options) SHOULD be
+		//            updated to include the current host and included in the IP
+		//            header of the Echo Reply message, without "truncation".
+		//            Thus, the recorded route will be for the entire round trip.
+		//
+		// So we need to let the option processor know how it should handle them.
+		var op optionsUsage
+		op = &optionUsageReceive{}
+		if h.Type() == header.ICMPv4Echo {
+			op = &optionUsageEcho{}
+		}
+		aux, tmp, err := processIPOptions(r, iph.Options(), op)
+		if err != nil {
+			switch {
+			case
+				errors.Is(err, header.ErrIPv4OptDuplicate),
+				errors.Is(err, errIPv4RecordRouteOptInvalidPointer),
+				errors.Is(err, errIPv4TimestampOptInvalidLength),
+				errors.Is(err, errIPv4TimestampOptInvalidPointer),
+				errors.Is(err, errIPv4TimestampOptOverflow):
+				_ = e.protocol.returnError(r, &icmpReasonParamProblem{pointer: aux}, pkt)
+				e.protocol.stack.Stats().MalformedRcvdPackets.Increment()
+				r.Stats().IP.MalformedPacketsReceived.Increment()
+			}
+			return
+		}
+		newOptions = tmp
+	}
+
 	// TODO(b/112892170): Meaningfully handle all ICMP types.
 	switch h.Type() {
 	case header.ICMPv4Echo:
 		received.Echo.Increment()
-
-		// Only send a reply if the checksum is valid.
-		headerChecksum := h.Checksum()
-		h.SetChecksum(0)
-		calculatedChecksum := ^header.ChecksumVV(pkt.Data, 0 /* initial */)
-		h.SetChecksum(headerChecksum)
-		if calculatedChecksum != headerChecksum {
-			// It's possible that a raw socket still expects to receive this.
-			e.dispatcher.DeliverTransportPacket(r, header.ICMPv4ProtocolNumber, pkt)
-			received.Invalid.Increment()
-			return
-		}
 
 		// DeliverTransportPacket will take ownership of pkt so don't use it beyond
 		// this point. Make a deep copy of the data before pkt gets sent as we will
@@ -98,9 +133,25 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer) {
 		// waiting endpoints. Consider moving responsibility for doing the copy to
 		// DeliverTransportPacket so that is is only done when needed.
 		replyData := pkt.Data.ToOwnedView()
-		replyIPHdr := header.IPv4(append(buffer.View(nil), pkt.NetworkHeader().View()...))
 
+		// Take the base of the incoming request IP header but replace the options.
+		// They may be smaller but never bigger.
+		replyHeaderLength := uint8(header.IPv4MinimumSize + len(newOptions))
+		replyIPHdr := header.IPv4(make([]byte, replyHeaderLength))
+		copy(replyIPHdr, iph[:header.IPv4MinimumSize])
+		if len(newOptions) > 0 {
+			copy(replyIPHdr[header.IPv4MinimumSize:], newOptions)
+		}
+		replyIPHdr.SetHeaderLength(replyHeaderLength)
+
+		// It's possible that a raw socket expects to receive this.
 		e.dispatcher.DeliverTransportPacket(r, header.ICMPv4ProtocolNumber, pkt)
+
+		sent := stats.ICMP.V4PacketsSent
+		if !r.Stack().AllowICMPMessage() {
+			sent.RateLimited.Increment()
+			return
+		}
 
 		// As per RFC 1122 section 3.2.1.3, when a host sends any datagram, the IP
 		// source address MUST be one of its own IP addresses (but not a broadcast
@@ -139,7 +190,8 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer) {
 		// The fields we need to alter.
 		//
 		// We need to produce the entire packet in the data segment in order to
-		// use WriteHeaderIncludedPacket().
+		// use WriteHeaderIncludedPacket(). WriteHeaderIncludedPacket does the
+		// total length and the header checksum so we don't need to do those here.
 		replyIPHdr.SetSourceAddress(r.LocalAddress)
 		replyIPHdr.SetDestinationAddress(r.RemoteAddress)
 		replyIPHdr.SetTTL(r.DefaultTTL())
@@ -157,8 +209,6 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer) {
 		})
 		replyPkt.TransportProtocolNumber = header.ICMPv4ProtocolNumber
 
-		// The checksum will be calculated so we don't need to do it here.
-		sent := stats.ICMP.V4PacketsSent
 		if err := r.WriteHeaderIncludedPacket(replyPkt); err != nil {
 			sent.Dropped.Increment()
 			return
@@ -236,6 +286,12 @@ func (*icmpReasonPortUnreachable) isICMPReason() {}
 type icmpReasonProtoUnreachable struct{}
 
 func (*icmpReasonProtoUnreachable) isICMPReason() {}
+
+// icmpReasonParamProblem is an error to use to request a Parameter Problem
+// message to be sent.
+type icmpReasonParamProblem struct{ pointer byte }
+
+func (*icmpReasonParamProblem) isICMPReason() {}
 
 // returnError takes an error descriptor and generates the appropriate ICMP
 // error packet for IPv4 and sends it back to the remote device that sent
@@ -377,17 +433,25 @@ func (p *protocol) returnError(r *stack.Route, reason icmpReason, pkt *stack.Pac
 	icmpPkt.TransportProtocolNumber = header.ICMPv4ProtocolNumber
 
 	icmpHdr := header.ICMPv4(icmpPkt.TransportHeader().Push(header.ICMPv4MinimumSize))
-	switch reason.(type) {
+	var counter *tcpip.StatCounter
+	switch reason := reason.(type) {
 	case *icmpReasonPortUnreachable:
+		icmpHdr.SetType(header.ICMPv4DstUnreachable)
 		icmpHdr.SetCode(header.ICMPv4PortUnreachable)
+		counter = sent.DstUnreachable
 	case *icmpReasonProtoUnreachable:
+		icmpHdr.SetType(header.ICMPv4DstUnreachable)
 		icmpHdr.SetCode(header.ICMPv4ProtoUnreachable)
+		counter = sent.DstUnreachable
+	case *icmpReasonParamProblem:
+		icmpHdr.SetType(header.ICMPv4ParamProblem)
+		icmpHdr.SetCode(header.ICMPv4UnusedCode)
+		icmpHdr.SetPointer(reason.pointer)
+		counter = sent.ParamProblem
 	default:
 		panic(fmt.Sprintf("unsupported ICMP type %T", reason))
 	}
-	icmpHdr.SetType(header.ICMPv4DstUnreachable)
 	icmpHdr.SetChecksum(header.ICMPv4Checksum(icmpHdr, icmpPkt.Data))
-	counter := sent.DstUnreachable
 
 	if err := route.WritePacket(
 		nil, /* gso */
