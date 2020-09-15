@@ -494,6 +494,22 @@ func TestLink(t *testing.T) {
 	}
 }
 
+// This test ensures we can enable ipv6 on loopback and run ping6 without errors
+func TestPing6Loopback(t *testing.T) {
+	ctx := context.Background()
+	d := dockerutil.MakeContainer(ctx, t)
+	defer d.CleanUp(ctx)
+
+	if got, err := d.Run(ctx, dockerutil.RunOpts{
+		Image:  "basic/ping6test",
+		CapAdd: []string{"CAP_NET_ADMIN"},
+	}, "/root/ping6.sh"); err != nil {
+		t.Fatalf("docker run failed: %s", err)
+	} else if got != "" {
+		t.Errorf("test failed:\n%s", got)
+	}
+}
+
 func TestMain(m *testing.M) {
 	dockerutil.EnsureSupportedDockerVersion()
 	flag.Parse()
