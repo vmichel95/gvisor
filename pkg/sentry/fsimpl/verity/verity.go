@@ -23,6 +23,7 @@ package verity
 
 import (
 	"fmt"
+	"io"
 	"strconv"
 	"sync/atomic"
 
@@ -626,6 +627,25 @@ func (fd *fileDescription) Ioctl(ctx context.Context, uio usermem.IO, args arch.
 	}
 }
 
+// Read implements vfs.FileDescriptionImpl.Read.
+func (fd *fileDescription) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
+	// Implement Read with PRead by getting file offset from Seek.
+	offset, err := fd.lowerFD.Seek(ctx, 0 /* offset */, linux.SEEK_CUR)
+	if err != nil {
+		return 0, err
+	}
+	n, readErr := fd.PRead(ctx, dst, offset, opts)
+	if readErr != nil && readErr != io.EOF {
+		return n, readErr
+	}
+
+	// Set lowerFD offset since Read should change it.
+	if _, err = fd.lowerFD.Seek(ctx, n, linux.SEEK_CUR); err != nil {
+		return 0, err
+	}
+	return n, readErr
+}
+
 // PRead implements vfs.FileDescriptionImpl.PRead.
 func (fd *fileDescription) PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts vfs.ReadOptions) (int64, error) {
 	// No need to verify if the file is not enabled yet in
@@ -668,7 +688,7 @@ func (fd *fileDescription) PRead(ctx context.Context, dst usermem.IOSequence, of
 	}
 
 	n, err := merkletree.Verify(dst.Writer(ctx), &dataReader, &merkleReader, int64(size), offset, dst.NumBytes(), fd.d.rootHash, false /* dataAndTreeInSameFile */)
-	if err != nil {
+	if err != nil && err != io.EOF {
 		return 0, alertIntegrityViolation(syserror.EINVAL, fmt.Sprintf("Verification failed: %v", err))
 	}
 	return n, err
