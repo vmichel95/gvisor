@@ -402,7 +402,7 @@ func handlePacketOutput(pkt *PacketBuffer, conn *conn, gso *GSO, r *Route, dir d
 	// Calculate the TCP checksum and set it.
 	tcpHeader.SetChecksum(0)
 	length := uint16(pkt.Size()) - uint16(len(pkt.NetworkHeader().View()))
-	xsum := r.PseudoHeaderChecksum(header.TCPProtocolNumber, length)
+	xsum := header.PseudoHeaderChecksum(header.TCPProtocolNumber, netHeader.SourceAddress(), netHeader.DestinationAddress(), length)
 	if gso != nil && gso.NeedsCsum {
 		tcpHeader.SetChecksum(xsum)
 	} else if r.Capabilities()&CapabilityTXChecksumOffload == 0 {
