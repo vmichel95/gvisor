@@ -25,3 +25,14 @@ go_library(
         "//tools/bigquery",
     ],
 )
+
+go_binary(
+    name = "parser",
+    testonly = 1,
+    srcs = ["parser_main.go"],
+    deps = [
+        ":parsers",
+        "//runsc/flag",
+        "//tools/bigquery",
+    ],
+)
