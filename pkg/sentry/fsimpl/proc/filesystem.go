@@ -17,6 +17,7 @@ package proc
 
 import (
 	"fmt"
+	"strconv"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
@@ -24,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/syserror"
 )
 
 // Name is the default filesystem name.
@@ -62,9 +64,22 @@ func (ft FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualF
 	if err != nil {
 		return nil, nil, err
 	}
+
+	mopts := vfs.GenericParseMountOptions(opts.Data)
+	maxCachedDentries := uint64(1000)
+	if str, ok := mopts["dentry_cache_limit"]; ok {
+		delete(mopts, "dentry_cache_limit")
+		maxCachedDentries, err = strconv.ParseUint(str, 10, 64)
+		if err != nil {
+			ctx.Warningf("gofer.FilesystemType.GetFilesystem: invalid dentry cache limit: dentry_cache_limit=%s", str)
+			return nil, nil, syserror.EINVAL
+		}
+	}
+
 	procfs := &filesystem{
 		devMinor: devMinor,
 	}
+	procfs.MaxCachedDentries = maxCachedDentries
 	procfs.VFSFilesystem().Init(vfsObj, &ft, procfs)
 
 	var cgroups map[string]string
@@ -73,7 +88,9 @@ func (ft FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualF
 		cgroups = data.Cgroups
 	}
 
-	_, dentry := procfs.newTasksInode(k, pidns, cgroups)
+	inode := procfs.newTasksInode(k, pidns, cgroups)
+	var dentry kernfs.Dentry
+	dentry.Init(&procfs.Filesystem, inode)
 	return procfs.VFSFilesystem(), dentry.VFSDentry(), nil
 }
 
@@ -94,12 +111,9 @@ type dynamicInode interface {
 	Init(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, data vfs.DynamicBytesSource, perm linux.FileMode)
 }
 
-func (fs *filesystem) newDentry(creds *auth.Credentials, ino uint64, perm linux.FileMode, inode dynamicInode) *kernfs.Dentry {
-	inode.Init(creds, linux.UNNAMED_MAJOR, fs.devMinor, ino, inode, perm)
-
-	d := &kernfs.Dentry{}
-	d.Init(inode)
-	return d
+func (fs *filesystem) newInode(creds *auth.Credentials, perm linux.FileMode, inode dynamicInode) dynamicInode {
+	inode.Init(creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), inode, perm)
+	return inode
 }
 
 // +stateify savable
@@ -114,8 +128,8 @@ func newStaticFile(data string) *staticFile {
 	return &staticFile{StaticData: vfs.StaticData{Data: data}}
 }
 
-func newStaticDir(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, perm linux.FileMode, children map[string]*kernfs.Dentry) *kernfs.Dentry {
-	return kernfs.NewStaticDir(creds, devMajor, devMinor, ino, perm, children, kernfs.GenericDirectoryFDOptions{
+func (fs *filesystem) newStaticDir(creds *auth.Credentials, children map[string]kernfs.Inode) kernfs.Inode {
+	return kernfs.NewStaticDir(creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), 0555, children, kernfs.GenericDirectoryFDOptions{
 		SeekEnd: kernfs.SeekEndZero,
 	})
 }
