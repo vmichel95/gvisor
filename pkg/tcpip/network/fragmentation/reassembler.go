@@ -25,9 +25,9 @@ import (
 )
 
 type hole struct {
-	first   uint16
-	last    uint16
-	deleted bool
+	first  uint16
+	last   uint16
+	filled bool
 }
 
 type reassembler struct {
@@ -37,7 +37,7 @@ type reassembler struct {
 	proto        uint8
 	mu           sync.Mutex
 	holes        []hole
-	deleted      int
+	filled       int
 	heap         fragHeap
 	done         bool
 	creationTime int64
@@ -51,31 +51,71 @@ func newReassembler(id FragmentID, clock tcpip.Clock) *reassembler {
 		creationTime: clock.NowMonotonic(),
 	}
 	r.holes = append(r.holes, hole{
-		first:   0,
-		last:    math.MaxUint16,
-		deleted: false})
+		first:  0,
+		last:   math.MaxUint16,
+		filled: false})
 	return r
 }
 
-// updateHoles updates the list of holes for an incoming fragment and
-// returns true iff the fragment filled at least part of an existing hole.
-func (r *reassembler) updateHoles(first, last uint16, more bool) bool {
-	used := false
+// updateHoles updates the list of holes for an incoming fragment. It returns
+// true if the fragment fits, it is not a duplicate and it does not overlap with
+// another fragment.
+//
+// For IPv6, overlaps with an existing fragment are explicitly forbidden by
+// RFC 8200 section 4.5:
+//   If any of the fragments being reassembled overlap with any other fragments
+//   being reassembled for the same packet, reassembly of that packet must be
+//   abandoned and all the fragments that have been received for that packet
+//   must be discarded, and no ICMP error messages should be sent.
+//
+// It is not explicitly forbidden for IPv4, but to keep parity with Linux we
+// disallow it as well:
+// https://github.com/torvalds/linux/blob/38525c6919e2f6b27c1855905f342a0def3cbdcf/net/ipv4/inet_fragment.c#L349
+func (r *reassembler) updateHoles(first, last uint16, more bool) (bool, error) {
 	for i := range r.holes {
-		if r.holes[i].deleted || first > r.holes[i].last || last < r.holes[i].first {
+		if first > r.holes[i].last || last < r.holes[i].first {
+			// The fragment does not share any space with the current hole.
 			continue
 		}
-		used = true
-		r.deleted++
-		r.holes[i].deleted = true
+
+		if r.holes[i].filled {
+			if first == r.holes[i].first && last == r.holes[i].last {
+				// The fragment exactly matches the filled hole, it means that it is a
+				// duplicate. This is not an error condition but the fragment should be
+				// discarded.
+				return false, nil
+			}
+
+			// The fragment overlaps with a hole that was previously filled.
+			return false, ErrFragmentOverlap
+		}
+
+		if first < r.holes[i].first || last > r.holes[i].last {
+			// The fragment overflows into another hole, it means that it overlaps
+			// with another fragment.
+			return false, ErrFragmentOverlap
+		}
+
+		r.filled++
 		if first > r.holes[i].first {
 			r.holes = append(r.holes, hole{r.holes[i].first, first - 1, false})
 		}
 		if last < r.holes[i].last && more {
 			r.holes = append(r.holes, hole{last + 1, r.holes[i].last, false})
 		}
+
+		// Update the current hole to precisely match the incoming fragment.
+		r.holes[i].first = first
+		r.holes[i].last = last
+		r.holes[i].filled = true
+
+		return true, nil
 	}
-	return used
+
+	// By this point, it means the incoming fragment's offset is past the size of
+	// the reassembled packet (which was determined by the fragment with
+	// more=false).
+	return false, ErrInvalidArgs
 }
 
 func (r *reassembler) process(first, last uint16, more bool, proto uint8, vv buffer.VectorisedView) (buffer.VectorisedView, uint8, bool, int, error) {
@@ -99,14 +139,20 @@ func (r *reassembler) process(first, last uint16, more bool, proto uint8, vv buf
 	if first == 0 {
 		r.proto = proto
 	}
-	if r.updateHoles(first, last, more) {
-		// We store the incoming packet only if it filled some holes.
+
+	used, err := r.updateHoles(first, last, more)
+	if err != nil {
+		return buffer.VectorisedView{}, 0, false, consumed, fmt.Errorf("fragment reassembly failed: %w", err)
+	}
+
+	if used {
 		heap.Push(&r.heap, fragment{offset: first, vv: vv.Clone(nil)})
 		consumed = vv.Size()
 		r.size += consumed
 	}
-	// Check if all the holes have been deleted and we are ready to reassamble.
-	if r.deleted < len(r.holes) {
+
+	// Check if all the holes have been filled and we are ready to reassemble.
+	if r.filled < len(r.holes) {
 		return buffer.VectorisedView{}, 0, false, consumed, nil
 	}
 	res, err := r.heap.reassemble()
