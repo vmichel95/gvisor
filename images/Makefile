@@ -60,6 +60,9 @@ local_image = $(LOCAL_IMAGE_PREFIX)/$(subst _,/,$(1))
 # we need to explicitly repull the base layer in order to ensure that the
 # architecture is correct. Note that we use the term "rebuild" here to avoid
 # conflicting with the bazel "build" terminology, which is used elsewhere.
+#
+# We use '--network host' due to
+# https://github.com/gliderlabs/docker-alpine/issues/307.
 rebuild-%: FROM=$(shell grep FROM "$(call path,$*)/$(call dockerfile,$*)" | cut -d' ' -f2)
 rebuild-%: register-cross
 	@if ! [ -f "$(call path,$*)/$(call dockerfile,$*)" ]; then \
@@ -68,6 +71,7 @@ rebuild-%: register-cross
 	$(foreach IMAGE,$(FROM),docker pull $(DOCKER_PLATFORM_ARGS) $(IMAGE) &&) \
 	T=$$(mktemp -d) && cp -a $(call path,$*)/* $$T && \
 		docker build $(DOCKER_PLATFORM_ARGS) \
+			--network host \
 			-f "$$T/$(call dockerfile,$*)" \
 			-t "$(call remote_image,$*)" \
 			$$T && \
