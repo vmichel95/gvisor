@@ -122,7 +122,7 @@ func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt *stack.PacketBu
 	return tcpip.ErrNotSupported
 }
 
-func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
+func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 	if !e.isEnabled() {
 		return
 	}
@@ -145,7 +145,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 			linkAddr := tcpip.LinkAddress(h.HardwareAddressSender())
 			e.linkAddrCache.AddLinkAddress(e.nic.ID(), addr, linkAddr)
 		} else {
-			if r.Stack().CheckLocalAddress(e.nic.ID(), header.IPv4ProtocolNumber, localAddr) == 0 {
+			if e.protocol.stack.CheckLocalAddress(e.nic.ID(), header.IPv4ProtocolNumber, localAddr) == 0 {
 				return // we have no useful answer, ignore the request
 			}
 
@@ -158,6 +158,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 			ReserveHeaderBytes: int(e.nic.MaxHeaderLength()) + header.ARPSize,
 		})
 		packet := header.ARP(respPkt.NetworkHeader().Push(header.ARPSize))
+		respPkt.NetworkProtocolNumber = ProtocolNumber
 		packet.SetIPv4OverEthernet()
 		packet.SetOp(header.ARPReply)
 		// TODO(gvisor.dev/issue/4582): check copied length once TAP devices have a
@@ -208,6 +209,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 
 // protocol implements stack.NetworkProtocol and stack.LinkAddressResolver.
 type protocol struct {
+	stack *stack.Stack
 }
 
 func (p *protocol) Number() tcpip.NetworkProtocolNumber { return ProtocolNumber }
@@ -297,6 +299,6 @@ func (*protocol) Parse(pkt *stack.PacketBuffer) (proto tcpip.TransportProtocolNu
 // Note, to make sure that the ARP endpoint receives ARP packets, the "arp"
 // address must be added to every NIC that should respond to ARP requests. See
 // ProtocolAddress for more details.
-func NewProtocol(*stack.Stack) stack.NetworkProtocol {
-	return &protocol{}
+func NewProtocol(s *stack.Stack) stack.NetworkProtocol {
+	return &protocol{stack: s}
 }
