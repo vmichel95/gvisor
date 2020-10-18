@@ -36,11 +36,15 @@ const SEM_UNDO = 0x1000
 
 // SemidDS is equivalent to struct semid64_ds.
 //
+// Source: include/uapi/asm/sembuf.h
+//
 // +marshal
 type SemidDS struct {
 	SemPerm  IPCPerm
 	SemOTime TimeT
+	unused1  uint64
 	SemCTime TimeT
+	unused2  uint64
 	SemNSems uint64
 	unused3  uint64
 	unused4  uint64
