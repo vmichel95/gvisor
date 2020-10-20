@@ -17,6 +17,7 @@ package tcp
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math"
 	"runtime"
 	"strings"
@@ -27,7 +28,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sleep"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/hash/jenkins"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/ports"
@@ -1281,8 +1281,8 @@ func (e *endpoint) LastError() *tcpip.Error {
 	return err
 }
 
-// Read reads data from the endpoint.
-func (e *endpoint) Read(*tcpip.FullAddress) (buffer.View, tcpip.ControlMessages, *tcpip.Error) {
+// Read implements tcpip.Endpoint.Read.
+func (e *endpoint) Read(dst io.Writer, count int, opts tcpip.ReadOptions) (tcpip.ReadResult, *tcpip.Error) {
 	e.LockUser()
 	defer e.UnlockUser()
 
@@ -1291,7 +1291,7 @@ func (e *endpoint) Read(*tcpip.FullAddress) (buffer.View, tcpip.ControlMessages,
 	// on a receive. It can expect to read any data after the handshake
 	// is complete. RFC793, section 3.9, p58.
 	if e.EndpointState() == StateSynSent {
-		return buffer.View{}, tcpip.ControlMessages{}, tcpip.ErrWouldBlock
+		return tcpip.ReadResult{}, tcpip.ErrWouldBlock
 	}
 
 	// The endpoint can be read if it's connected, or if it's already closed
@@ -1304,54 +1304,75 @@ func (e *endpoint) Read(*tcpip.FullAddress) (buffer.View, tcpip.ControlMessages,
 		e.rcvListMu.Unlock()
 		he := e.HardError
 		if s == StateError {
-			return buffer.View{}, tcpip.ControlMessages{}, he
+			return tcpip.ReadResult{}, he
 		}
 		e.stats.ReadErrors.NotConnected.Increment()
-		return buffer.View{}, tcpip.ControlMessages{}, tcpip.ErrNotConnected
+		return tcpip.ReadResult{}, tcpip.ErrNotConnected
 	}
 
-	v, err := e.readLocked()
+	n, err := e.readLocked(dst, count, opts)
 	e.rcvListMu.Unlock()
 
 	if err == tcpip.ErrClosedForReceive {
 		e.stats.ReadErrors.ReadClosed.Increment()
 	}
-	return v, tcpip.ControlMessages{}, err
+	return tcpip.ReadResult{
+		Count: n,
+		Total: n,
+	}, err
 }
 
-func (e *endpoint) readLocked() (buffer.View, *tcpip.Error) {
+func (e *endpoint) readLocked(dst io.Writer, count int, opts tcpip.ReadOptions) (int, *tcpip.Error) {
 	if e.rcvBufUsed == 0 {
 		if e.rcvClosed || !e.EndpointState().connected() {
-			return buffer.View{}, tcpip.ErrClosedForReceive
+			return 0, tcpip.ErrClosedForReceive
 		}
-		return buffer.View{}, tcpip.ErrWouldBlock
+		return 0, tcpip.ErrWouldBlock
 	}
 
+	var err error
+	done := 0
+	memDelta := 0
 	s := e.rcvList.Front()
-	views := s.data.Views()
-	v := views[s.viewToDeliver]
-	s.viewToDeliver++
+	for s != nil && done < count {
+		var n int
+		n, err = tcpip.ReadAtMostToVV(dst, &s.data, count-done, opts.Peek)
+		// Book keeping first then error handling.
 
-	var delta int
-	if s.viewToDeliver >= len(views) {
-		e.rcvList.Remove(s)
-		// We only free up receive buffer space when the segment is released as the
-		// segment is still holding on to the views even though some views have been
-		// read out to the user.
-		delta = s.segMemSize()
-		s.decRef()
+		if opts.Peek {
+			s = s.Next()
+		} else {
+			if s.data.Size() == 0 {
+				e.rcvList.Remove(s)
+				// Memory is only considered released when the whole segment has been
+				// read.
+				memDelta += s.segMemSize()
+				s.decRef()
+				s = e.rcvList.Front()
+			}
+			e.rcvBufUsed -= n
+		}
+		done += n
+
+		if err != nil {
+			break
+		}
 	}
 
-	e.rcvBufUsed -= len(v)
-	// If the window was small before this read and if the read freed up
-	// enough buffer space, to either fit an aMSS or half a receive buffer
-	// (whichever smaller), then notify the protocol goroutine to send a
-	// window update.
-	if crossed, above := e.windowCrossedACKThresholdLocked(delta); crossed && above {
-		e.notifyProtocolGoroutine(notifyNonZeroReceiveWindow)
+	if memDelta > 0 {
+		// If the window was small before this read and if the read freed up
+		// enough buffer space, to either fit an aMSS or half a receive buffer
+		// (whichever smaller), then notify the protocol goroutine to send a
+		// window update.
+		if crossed, above := e.windowCrossedACKThresholdLocked(memDelta); crossed && above {
+			e.notifyProtocolGoroutine(notifyNonZeroReceiveWindow)
+		}
 	}
 
-	return v, nil
+	if err != nil {
+		return done, tcpip.ErrInputOutput
+	}
+	return done, nil
 }
 
 // isEndpointWritableLocked checks if a given endpoint is writable
@@ -1463,64 +1484,6 @@ func (e *endpoint) Write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, <-c
 
 	// Locks released in queueAndSend()
 	return queueAndSend()
-}
-
-// Peek reads data without consuming it from the endpoint.
-//
-// This method does not block if there is no data pending.
-func (e *endpoint) Peek(vec [][]byte) (int64, tcpip.ControlMessages, *tcpip.Error) {
-	e.LockUser()
-	defer e.UnlockUser()
-
-	// The endpoint can be read if it's connected, or if it's already closed
-	// but has some pending unread data.
-	if s := e.EndpointState(); !s.connected() && s != StateClose {
-		if s == StateError {
-			return 0, tcpip.ControlMessages{}, e.HardError
-		}
-		e.stats.ReadErrors.InvalidEndpointState.Increment()
-		return 0, tcpip.ControlMessages{}, tcpip.ErrInvalidEndpointState
-	}
-
-	e.rcvListMu.Lock()
-	defer e.rcvListMu.Unlock()
-
-	if e.rcvBufUsed == 0 {
-		if e.rcvClosed || !e.EndpointState().connected() {
-			e.stats.ReadErrors.ReadClosed.Increment()
-			return 0, tcpip.ControlMessages{}, tcpip.ErrClosedForReceive
-		}
-		return 0, tcpip.ControlMessages{}, tcpip.ErrWouldBlock
-	}
-
-	// Make a copy of vec so we can modify the slide headers.
-	vec = append([][]byte(nil), vec...)
-
-	var num int64
-	for s := e.rcvList.Front(); s != nil; s = s.Next() {
-		views := s.data.Views()
-
-		for i := s.viewToDeliver; i < len(views); i++ {
-			v := views[i]
-
-			for len(v) > 0 {
-				if len(vec) == 0 {
-					return num, tcpip.ControlMessages{}, nil
-				}
-				if len(vec[0]) == 0 {
-					vec = vec[1:]
-					continue
-				}
-
-				n := copy(vec[0], v)
-				v = v[n:]
-				vec[0] = vec[0][n:]
-				num += int64(n)
-			}
-		}
-	}
-
-	return num, tcpip.ControlMessages{}, nil
 }
 
 // selectWindowLocked returns the new window without checking for shrinking or scaling

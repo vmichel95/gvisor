@@ -15,12 +15,12 @@
 package integration_test
 
 import (
+	"bytes"
 	"net"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/link/ethernet"
 	"gvisor.dev/gvisor/pkg/tcpip/link/pipe"
 	"gvisor.dev/gvisor/pkg/tcpip/network/arp"
@@ -344,24 +344,27 @@ func TestForwarding(t *testing.T) {
 				// Wait for the endpoint to be readable.
 				<-ch
 
-				var addr tcpip.FullAddress
-				v, _, err := ep.Read(&addr)
+				var buf bytes.Buffer
+				res, err := ep.Read(&buf, len(data), tcpip.ReadOptions{NeedRemoteAddr: true})
 				if err != nil {
-					t.Fatalf("ep.Read(_): %s", err)
+					t.Fatalf("ep.Read: %s", err)
 				}
 
-				if diff := cmp.Diff(v, buffer.View(data)); diff != "" {
+				if got, want := res.Count, len(data); got != want {
+					t.Errorf("res.Count = %d, want %d", got, want)
+				}
+				if diff := cmp.Diff(buf.Bytes(), data); diff != "" {
 					t.Errorf("received data mismatch (-want +got):\n%s", diff)
 				}
-				if addr.Addr != expectedFrom {
-					t.Errorf("got addr.Addr = %s, want = %s", addr.Addr, expectedFrom)
+				if res.RemoteAddr.Addr != expectedFrom {
+					t.Errorf("got res.RemoteAddr.Addr = %s, want = %s", res.RemoteAddr.Addr, expectedFrom)
 				}
 
 				if t.Failed() {
 					t.FailNow()
 				}
 
-				return addr
+				return res.RemoteAddr
 			}
 
 			addr := read(epsAndAddrs.serverReadableCH, epsAndAddrs.serverEP, data, epsAndAddrs.clientAddr)

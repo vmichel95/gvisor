@@ -15,6 +15,7 @@
 package integration_test
 
 import (
+	"bytes"
 	"net"
 	"testing"
 
@@ -422,17 +423,16 @@ func TestIncomingMulticastAndBroadcast(t *testing.T) {
 			}
 
 			rxUDP(e, test.dstAddr)
-			if gotPayload, _, err := ep.Read(nil); test.expectRx {
+			var buf bytes.Buffer
+			if res, err := ep.Read(&buf, len(data), tcpip.ReadOptions{}); test.expectRx {
 				if err != nil {
-					t.Fatalf("Read(nil): %s", err)
+					t.Fatalf("Read: %s", err)
 				}
-				if diff := cmp.Diff(buffer.View(data), gotPayload); diff != "" {
+				if diff := cmp.Diff(data, buf.Bytes()); diff != "" {
 					t.Errorf("got UDP payload mismatch (-want +got):\n%s", diff)
 				}
-			} else {
-				if err != tcpip.ErrWouldBlock {
-					t.Fatalf("got Read(nil) = (%x, _, %s), want = (_, _, %s)", gotPayload, err, tcpip.ErrWouldBlock)
-				}
+			} else if err != tcpip.ErrWouldBlock {
+				t.Fatalf("got Read = (%v, %s) [with data %x], want = (_, %s)", res, err, buf.Bytes(), tcpip.ErrWouldBlock)
 			}
 		})
 	}
@@ -546,9 +546,10 @@ func TestReuseAddrAndBroadcast(t *testing.T) {
 				}
 
 				for j, rep := range eps {
-					if gotPayload, _, err := rep.Read(nil); err != nil {
+					var buf bytes.Buffer
+					if _, err := rep.Read(&buf, len(data), tcpip.ReadOptions{}); err != nil {
 						t.Errorf("(eps[%d] write) eps[%d].Read(nil): %s", i, j, err)
-					} else if diff := cmp.Diff(buffer.View(data), gotPayload); diff != "" {
+					} else if diff := cmp.Diff([]byte(data), buf.Bytes()); diff != "" {
 						t.Errorf("(eps[%d] write) got UDP payload from eps[%d] mismatch (-want +got):\n%s", i, j, diff)
 					}
 				}

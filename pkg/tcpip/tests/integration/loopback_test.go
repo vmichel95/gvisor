@@ -15,6 +15,7 @@
 package integration_test
 
 import (
+	"bytes"
 	"testing"
 	"time"
 
@@ -236,17 +237,16 @@ func TestLoopbackAcceptAllInSubnet(t *testing.T) {
 				t.Fatalf("got sep.Write(_, _) = (%d, _, nil), want = (%d, _, nil)", n, want)
 			}
 
-			if gotPayload, _, err := rep.Read(nil); test.expectRx {
+			var buf bytes.Buffer
+			if res, err := rep.Read(&buf, len(data), tcpip.ReadOptions{}); test.expectRx {
 				if err != nil {
-					t.Fatalf("reep.Read(nil): %s", err)
+					t.Fatalf("reep.Read: %s", err)
 				}
-				if diff := cmp.Diff(buffer.View(data), gotPayload); diff != "" {
+				if diff := cmp.Diff(data, buf.Bytes()); diff != "" {
 					t.Errorf("got UDP payload mismatch (-want +got):\n%s", diff)
 				}
-			} else {
-				if err != tcpip.ErrWouldBlock {
-					t.Fatalf("got rep.Read(nil) = (%x, _, %s), want = (_, _, %s)", gotPayload, err, tcpip.ErrWouldBlock)
-				}
+			} else if err != tcpip.ErrWouldBlock {
+				t.Fatalf("got rep.Read = (%v, %s) [with data %x], want = (_, %s)", res, err, buf.Bytes(), tcpip.ErrWouldBlock)
 			}
 		})
 	}

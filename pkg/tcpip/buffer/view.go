@@ -105,18 +105,18 @@ func (vv *VectorisedView) TrimFront(count int) {
 }
 
 // Read implements io.Reader.
-func (vv *VectorisedView) Read(v View) (copied int, err error) {
-	count := len(v)
+func (vv *VectorisedView) Read(b []byte) (copied int, err error) {
+	count := len(b)
 	for count > 0 && len(vv.views) > 0 {
 		if count < len(vv.views[0]) {
 			vv.size -= count
-			copy(v[copied:], vv.views[0][:count])
+			copy(b[copied:], vv.views[0][:count])
 			vv.views[0].TrimFront(count)
 			copied += count
 			return copied, nil
 		}
 		count -= len(vv.views[0])
-		copy(v[copied:], vv.views[0])
+		copy(b[copied:], vv.views[0])
 		copied += len(vv.views[0])
 		vv.removeFirst()
 	}

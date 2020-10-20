@@ -36,7 +36,7 @@ const (
 
 // segment represents a TCP segment. It holds the payload and parsed TCP segment
 // information, and can be added to intrusive lists.
-// segment is mostly immutable, the only field allowed to change is viewToDeliver.
+// segment is mostly immutable, the only field allowed to change is data.
 //
 // +stateify savable
 type segment struct {
@@ -50,10 +50,7 @@ type segment struct {
 	hdr    header.TCP
 	// views is used as buffer for data when its length is large
 	// enough to store a VectorisedView.
-	views [8]buffer.View `state:"nosave"`
-	// viewToDeliver keeps track of the next View that should be
-	// delivered by the Read endpoint.
-	viewToDeliver  int
+	views          [8]buffer.View `state:"nosave"`
 	sequenceNumber seqnum.Value
 	ackNumber      seqnum.Value
 	flags          uint8
@@ -74,6 +71,9 @@ type segment struct {
 
 	// acked indicates if the segment has already been SACKed.
 	acked bool
+
+	// dataMemSize is the memory used by data initially.
+	dataMemSize int
 }
 
 func newSegment(r *stack.Route, id stack.TransportEndpointID, pkt *stack.PacketBuffer) *segment {
@@ -85,6 +85,7 @@ func newSegment(r *stack.Route, id stack.TransportEndpointID, pkt *stack.PacketB
 	s.data = pkt.Data.Clone(s.views[:])
 	s.hdr = header.TCP(pkt.TransportHeader().View())
 	s.rcvdTime = time.Now()
+	s.dataMemSize = s.data.Size()
 	return s
 }
 
@@ -99,6 +100,7 @@ func newSegmentFromView(r *stack.Route, id stack.TransportEndpointID, v buffer.V
 		s.views[0] = v
 		s.data = buffer.NewVectorisedView(len(v), s.views[:1])
 	}
+	s.dataMemSize = s.data.Size()
 	return s
 }
 
@@ -111,12 +113,12 @@ func (s *segment) clone() *segment {
 		flags:          s.flags,
 		window:         s.window,
 		route:          s.route.Clone(),
-		viewToDeliver:  s.viewToDeliver,
 		rcvdTime:       s.rcvdTime,
 		xmitTime:       s.xmitTime,
 		xmitCount:      s.xmitCount,
 		ep:             s.ep,
 		qFlags:         s.qFlags,
+		dataMemSize:    s.dataMemSize,
 	}
 	t.data = s.data.Clone(t.views[:])
 	return t
@@ -189,7 +191,7 @@ func (s *segment) payloadSize() int {
 // segMemSize is the amount of memory used to hold the segment data and
 // the associated metadata.
 func (s *segment) segMemSize() int {
-	return segSize + s.data.Size()
+	return segSize + s.dataMemSize
 }
 
 // parse populates the sequence & ack numbers, flags, and window fields of the

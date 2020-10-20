@@ -16,6 +16,7 @@ package udp
 
 import (
 	"fmt"
+	"io"
 
 	"gvisor.dev/gvisor/pkg/sleep"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -269,11 +270,10 @@ func (e *endpoint) Close() {
 // ModerateRecvBuf implements tcpip.Endpoint.ModerateRecvBuf.
 func (e *endpoint) ModerateRecvBuf(copied int) {}
 
-// Read reads data from the endpoint. This method does not block if
-// there is no data pending.
-func (e *endpoint) Read(addr *tcpip.FullAddress) (buffer.View, tcpip.ControlMessages, *tcpip.Error) {
+// Read implements tcpip.Endpoint.Read.
+func (e *endpoint) Read(dst io.Writer, count int, opts tcpip.ReadOptions) (tcpip.ReadResult, *tcpip.Error) {
 	if err := e.LastError(); err != nil {
-		return buffer.View{}, tcpip.ControlMessages{}, err
+		return tcpip.ReadResult{}, err
 	}
 
 	e.rcvMu.Lock()
@@ -285,18 +285,17 @@ func (e *endpoint) Read(addr *tcpip.FullAddress) (buffer.View, tcpip.ControlMess
 			err = tcpip.ErrClosedForReceive
 		}
 		e.rcvMu.Unlock()
-		return buffer.View{}, tcpip.ControlMessages{}, err
+		return tcpip.ReadResult{}, err
 	}
 
 	p := e.rcvList.Front()
-	e.rcvList.Remove(p)
-	e.rcvBufSize -= p.data.Size()
+	if !opts.Peek {
+		e.rcvList.Remove(p)
+		e.rcvBufSize -= p.data.Size()
+	}
 	e.rcvMu.Unlock()
 
-	if addr != nil {
-		*addr = p.senderAddress
-	}
-
+	// Control Messages
 	cm := tcpip.ControlMessages{
 		HasTimestamp: true,
 		Timestamp:    p.timestamp,
@@ -319,7 +318,22 @@ func (e *endpoint) Read(addr *tcpip.FullAddress) (buffer.View, tcpip.ControlMess
 		cm.HasIPPacketInfo = true
 		cm.PacketInfo = p.packetInfo
 	}
-	return p.data.ToView(), cm, nil
+
+	// Read Result
+	res := tcpip.ReadResult{
+		Total:           p.data.Size(),
+		ControlMessages: cm,
+	}
+	if opts.NeedRemoteAddr {
+		res.RemoteAddr = p.senderAddress
+	}
+
+	n, err := tcpip.ReadAtMostToVV(dst, &p.data, count, opts.Peek)
+	if err != nil {
+		return res, tcpip.ErrInputOutput
+	}
+	res.Count = n
+	return res, nil
 }
 
 // prepareForWrite prepares the endpoint for sending data. In particular, it
@@ -538,11 +552,6 @@ func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, <-c
 		return 0, nil, err
 	}
 	return int64(len(v)), nil, nil
-}
-
-// Peek only returns data from a single datagram, so do nothing here.
-func (e *endpoint) Peek([][]byte) (int64, tcpip.ControlMessages, *tcpip.Error) {
-	return 0, tcpip.ControlMessages{}, nil
 }
 
 // SetSockOptBool implements tcpip.Endpoint.SetSockOptBool.

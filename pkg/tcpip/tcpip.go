@@ -31,6 +31,7 @@ package tcpip
 import (
 	"errors"
 	"fmt"
+	"io"
 	"math/bits"
 	"reflect"
 	"strconv"
@@ -112,6 +113,7 @@ var (
 	ErrNotPermitted              = &Error{msg: "operation not permitted"}
 	ErrAddressFamilyNotSupported = &Error{msg: "address family not supported by protocol"}
 	ErrMalformedHeader           = &Error{msg: "header is malformed"}
+	ErrInputOutput               = &Error{msg: "input/output error"}
 )
 
 var messageToError map[string]*Error
@@ -161,6 +163,7 @@ func StringToError(s string) *Error {
 			ErrNotPermitted,
 			ErrAddressFamilyNotSupported,
 			ErrMalformedHeader,
+			ErrInputOutput,
 		}
 
 		messageToError = make(map[string]*Error)
@@ -448,6 +451,78 @@ func (s SlicePayload) Payload(size int) ([]byte, *Error) {
 	return s[:size], nil
 }
 
+// SliceWriter implements io.Writer for slices. It panics if writing beyond
+// boundary.
+type SliceWriter []byte
+
+// Write implements io.Writer.Write.
+func (s *SliceWriter) Write(b []byte) (int, error) {
+	if copy(*s, b) != len(b) {
+		panic("b is too long")
+	}
+	*s = (*s)[len(b):]
+	return len(b), nil
+}
+
+// VectorisedViewWriter implements io.Writer for an underlying VectorisedView.
+// Use this type to hint netstack on efficient transfer of underlying bytes
+// storage.
+type VectorisedViewWriter struct {
+	vv *buffer.VectorisedView
+}
+
+// NewVectorisedViewWriter returns a new VectorisedViewWriter.
+func NewVectorisedViewWriter(vv *buffer.VectorisedView) VectorisedViewWriter {
+	return VectorisedViewWriter{vv}
+}
+
+// Write implements io.Writer.Write.
+func (w *VectorisedViewWriter) Write(b []byte) (int, error) {
+	w.vv.AppendView(append(buffer.View(nil), b...))
+	return len(b), nil
+}
+
+// ReadAtMostToVV reads up to atMost bytes from src to dst. If peek is true, the
+// bytes are copied; otherwise, bytes are removed from src after read.
+func ReadAtMostToVV(dst io.Writer, src *buffer.VectorisedView, atMost int, peek bool) (int, error) {
+	// Specialization for moving data from one VV to another.
+	if !peek {
+		if dst, ok := dst.(*VectorisedViewWriter); ok {
+			n := src.Size()
+			if n > atMost {
+				n = atMost
+			}
+			src.ReadToVV(dst.vv, n)
+			return n, nil
+		}
+	}
+
+	var err error
+	done := 0
+	for _, v := range src.Views() {
+		remaining := atMost - done
+		if remaining == 0 {
+			break
+		}
+		if len(v) > remaining {
+			v = v[:remaining]
+		}
+
+		var n int
+		n, err = dst.Write(v)
+		if n > 0 {
+			done += n
+		}
+		if err != nil {
+			break
+		}
+	}
+	if !peek {
+		src.TrimFront(done)
+	}
+	return done, err
+}
+
 // A ControlMessages contains socket control messages for IP sockets.
 //
 // +stateify savable
@@ -493,6 +568,40 @@ type PacketOwner interface {
 	GID() uint32
 }
 
+// ReadOptions contains options for Endpoint.Read.
+type ReadOptions struct {
+	// Peek indicates whether this read is a peek.
+	Peek bool
+
+	// NeedRemoteAddr indicates whether to return the remote address, if
+	// supported.
+	NeedRemoteAddr bool
+
+	// NeedLinkPacketInfo indicates whether to return the link-layer information,
+	// if supported.
+	NeedLinkPacketInfo bool
+}
+
+// ReadResult represents result for a successful Endpoint.Read.
+type ReadResult struct {
+	// Count is the number of bytes received and written to the buffer.
+	Count int
+
+	// Total is the number of bytes of the received packet. This can be used to
+	// determine whether the read is truncated.
+	Total int
+
+	// ControlMessages is the control messages received.
+	ControlMessages ControlMessages
+
+	// RemoteAddr is the remote address if ReadOptions.NeedAddr is true.
+	RemoteAddr FullAddress
+
+	// LinkPacketInfo is the link-layer information of the received packet if
+	// ReadOptions.NeedLinkPacketInfo is true.
+	LinkPacketInfo LinkPacketInfo
+}
+
 // Endpoint is the interface implemented by transport protocols (e.g., tcp, udp)
 // that exposes functionality like read, write, connect, etc. to users of the
 // networking stack.
@@ -507,11 +616,14 @@ type Endpoint interface {
 	// Abort is best effort; implementing Abort with Close is acceptable.
 	Abort()
 
-	// Read reads data from the endpoint and optionally returns the sender.
+	// Read reads data from the endpoint and optionally writes to w.
 	//
-	// This method does not block if there is no data pending. It will also
-	// either return an error or data, never both.
-	Read(*FullAddress) (buffer.View, ControlMessages, *Error)
+	// This method does not block if there is no data pending; in this case,
+	// ErrWouldBlock is returned.
+	//
+	// If dst returns an error, ErrInputOutput will be returned; in this case
+	// res.Count may also be non-zero.
+	Read(dst io.Writer, count int, opts ReadOptions) (res ReadResult, err *Error)
 
 	// Write writes data to the endpoint's peer. This method does not block if
 	// the data cannot be written.
@@ -532,11 +644,6 @@ type Endpoint interface {
 	// block. Channel is closed once address resolution is complete (success or
 	// not). The channel is only non-nil in this case.
 	Write(Payloader, WriteOptions) (int64, <-chan struct{}, *Error)
-
-	// Peek reads data without consuming it from the endpoint.
-	//
-	// This method does not block if there is no data pending.
-	Peek([][]byte) (int64, ControlMessages, *Error)
 
 	// Connect connects the endpoint to its peer. Specifying a NIC is
 	// optional.
@@ -646,17 +753,6 @@ type LinkPacketInfo struct {
 
 	// PktType is used to indicate the destination of the packet.
 	PktType PacketType
-}
-
-// PacketEndpoint are additional methods that are only implemented by Packet
-// endpoints.
-type PacketEndpoint interface {
-	// ReadPacket reads a datagram/packet from the endpoint and optionally
-	// returns the sender and additional LinkPacketInfo.
-	//
-	// This method does not block if there is no data pending. It will also
-	// either return an error or data, never both.
-	ReadPacket(*FullAddress, *LinkPacketInfo) (buffer.View, ControlMessages, *Error)
 }
 
 // EndpointInfo is the interface implemented by each endpoint info struct.

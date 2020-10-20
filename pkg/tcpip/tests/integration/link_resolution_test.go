@@ -15,6 +15,7 @@
 package integration_test
 
 import (
+	"bytes"
 	"net"
 	"testing"
 
@@ -204,16 +205,17 @@ func TestPing(t *testing.T) {
 			// Wait for the endpoint to be readable.
 			<-waiterCH
 
-			var addr tcpip.FullAddress
-			v, _, err := ep.Read(&addr)
+			var buf bytes.Buffer
+			res, err := ep.Read(&buf, len(icmpBuf), tcpip.ReadOptions{NeedRemoteAddr: true})
 			if err != nil {
-				t.Fatalf("ep.Read(_): %s", err)
+				t.Fatalf("ep.Read: %s", err)
 			}
+			v := buffer.View(buf.Bytes())
 			if diff := cmp.Diff(v[icmpDataOffset:], icmpBuf[icmpDataOffset:]); diff != "" {
 				t.Errorf("received data mismatch (-want +got):\n%s", diff)
 			}
-			if addr.Addr != test.remoteAddr {
-				t.Errorf("got addr.Addr = %s, want = %s", addr.Addr, test.remoteAddr)
+			if res.RemoteAddr.Addr != test.remoteAddr {
+				t.Errorf("got res.RemoteAddr.Addr = %s, want = %s", res.RemoteAddr.Addr, test.remoteAddr)
 			}
 		})
 	}

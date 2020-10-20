@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io/ioutil"
 	"math/rand"
 	"testing"
 	"time"
@@ -599,13 +600,13 @@ func testReadInternal(c *testContext, flow testFlow, packetShouldBeDropped, expe
 	// Take a snapshot of the stats to validate them at the end of the test.
 	epstats := c.ep.Stats().(*tcpip.TransportEndpointStats).Clone()
 
-	var addr tcpip.FullAddress
-	v, cm, err := c.ep.Read(&addr)
+	var buf bytes.Buffer
+	res, err := c.ep.Read(&buf, defaultMTU, tcpip.ReadOptions{NeedRemoteAddr: true})
 	if err == tcpip.ErrWouldBlock {
 		// Wait for data to become available.
 		select {
 		case <-ch:
-			v, cm, err = c.ep.Read(&addr)
+			res, err = c.ep.Read(&buf, defaultMTU, tcpip.ReadOptions{NeedRemoteAddr: true})
 
 		case <-time.After(300 * time.Millisecond):
 			if packetShouldBeDropped {
@@ -625,23 +626,24 @@ func testReadInternal(c *testContext, flow testFlow, packetShouldBeDropped, expe
 	}
 
 	if packetShouldBeDropped {
-		c.t.Fatalf("Read unexpectedly received data from %s", addr.Addr)
+		c.t.Fatalf("Read unexpectedly received data from %s", res.RemoteAddr.Addr)
 	}
 
 	// Check the peer address.
 	h := flow.header4Tuple(incoming)
-	if addr.Addr != h.srcAddr.Addr {
-		c.t.Fatalf("got address = %s, want = %s", addr.Addr, h.srcAddr.Addr)
+	if res.RemoteAddr.Addr != h.srcAddr.Addr {
+		c.t.Fatalf("got address = %s, want = %s", res.RemoteAddr.Addr, h.srcAddr.Addr)
 	}
 
 	// Check the payload.
+	v := buf.Bytes()
 	if !bytes.Equal(payload, v) {
 		c.t.Fatalf("got payload = %x, want = %x", v, payload)
 	}
 
 	// Run any checkers against the ControlMessages.
 	for _, f := range checkers {
-		f(c.t, cm)
+		f(c.t, res.ControlMessages)
 	}
 
 	c.checkEndpointReadStats(1, epstats, err)
@@ -832,8 +834,8 @@ func TestV4ReadSelfSource(t *testing.T) {
 				t.Errorf("c.s.Stats().IP.InvalidSourceAddressesReceived got %d, want %d", got, tt.wantInvalidSource)
 			}
 
-			if _, _, err := c.ep.Read(nil); err != tt.wantErr {
-				t.Errorf("got c.ep.Read(nil) = %s, want = %s", err, tt.wantErr)
+			if _, err := c.ep.Read(ioutil.Discard, defaultMTU, tcpip.ReadOptions{}); err != tt.wantErr {
+				t.Errorf("got c.ep.Read = %s, want = %s", err, tt.wantErr)
 			}
 		})
 	}

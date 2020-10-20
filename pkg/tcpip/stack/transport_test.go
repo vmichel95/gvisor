@@ -15,6 +15,7 @@
 package stack_test
 
 import (
+	"io"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -75,8 +76,8 @@ func (*fakeTransportEndpoint) Readiness(mask waiter.EventMask) waiter.EventMask 
 	return mask
 }
 
-func (*fakeTransportEndpoint) Read(*tcpip.FullAddress) (buffer.View, tcpip.ControlMessages, *tcpip.Error) {
-	return buffer.View{}, tcpip.ControlMessages{}, nil
+func (*fakeTransportEndpoint) Read(io.Writer, int, tcpip.ReadOptions) (tcpip.ReadResult, *tcpip.Error) {
+	return tcpip.ReadResult{}, nil
 }
 
 func (f *fakeTransportEndpoint) Write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, <-chan struct{}, *tcpip.Error) {
@@ -98,10 +99,6 @@ func (f *fakeTransportEndpoint) Write(p tcpip.Payloader, opts tcpip.WriteOptions
 	}
 
 	return int64(len(v)), nil, nil
-}
-
-func (*fakeTransportEndpoint) Peek([][]byte) (int64, tcpip.ControlMessages, *tcpip.Error) {
-	return 0, tcpip.ControlMessages{}, nil
 }
 
 // SetSockOpt sets a socket option. Currently not supported.
