@@ -284,12 +284,6 @@ func (e *neighborEntry) setStateLocked(next NeighborState) {
 			}
 
 			retryCounter++
-			if retryCounter == config.MaxUnicastProbes {
-				e.dispatchRemoveEventLocked()
-				e.setStateLocked(Failed)
-				return
-			}
-
 			e.job = e.nic.stack.newJob(&e.mu, sendUnicastProbe)
 			e.job.Schedule(config.RetransmitTimer)
 		}
