@@ -1188,7 +1188,9 @@ func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, n
 
 	isLocalBroadcast := remoteAddr == header.IPv4Broadcast
 	isMulticast := header.IsV4MulticastAddress(remoteAddr) || header.IsV6MulticastAddress(remoteAddr)
-	needRoute := !(isLocalBroadcast || isMulticast || header.IsV6LinkLocalAddress(remoteAddr))
+	isLinkLocal := header.IsV6LinkLocalAddress(remoteAddr)
+	IsLoopback := header.IsV4LoopbackAddress(remoteAddr) || header.IsV6LoopbackAddress(remoteAddr)
+	needRoute := !(isLocalBroadcast || isMulticast || isLinkLocal || IsLoopback)
 	if id != 0 && !needRoute {
 		if nic, ok := s.nics[id]; ok && nic.Enabled() {
 			if addressEndpoint := s.getAddressEP(nic, localAddr, remoteAddr, netProto); addressEndpoint != nil {
@@ -1224,6 +1226,9 @@ func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, n
 	}
 
 	if !needRoute {
+		if IsLoopback {
+			return Route{}, tcpip.ErrBadLocalAddress
+		}
 		return Route{}, tcpip.ErrNetworkUnreachable
 	}
 
