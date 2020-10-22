@@ -55,6 +55,8 @@ go_library(
         "sched.go",
         "seccomp.go",
         "sem.go",
+        "sembuf_amd64.go",
+        "sembuf_arm64.go",
         "shm.go",
         "signal.go",
         "signalfd.go",
